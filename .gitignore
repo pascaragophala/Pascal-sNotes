@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+storage/
+.pycharm/
+.vscode/
+.env
+pascals_notes.db
