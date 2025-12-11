@@ -1,16 +1,15 @@
+# pascals_notes_app.py
 """
-Pascal'sNotes - single-file Flask app (updated UI + grade support)
+Pascal'sNotes - updated to support single or multiple file uploads
 
-What's changed in this version:
-- Subjects now include the grade(s) they apply to and are shown as grade badges on the Subjects page.
-- Upload form now requires selecting a grade (subject-dependent).
-- The database includes a 'grade' column and the app will add it if your existing DB is missing it.
-- Browse page supports optional grade filtering.
-- UI restyled using Bootstrap + custom CSS for a cleaner, more modern look.
-
-Run the same way as before.
+What's changed:
+- Upload form (user) accepts multiple files at once (input name 'files', multiple attribute)
+- Admin upload form accepts multiple files too
+- Server handles request.files.getlist('files') and processes each PDF separately
+- Database entries created per file (subject + grade preserved)
+- Flash summary shows how many files were accepted / rejected
+- All other behaviour unchanged
 """
-
 from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory, flash, session
 from werkzeug.utils import secure_filename
 import os
@@ -27,7 +26,7 @@ PENDING_DIR = os.path.join(STORAGE_DIR, 'pending')
 APPROVED_DIR = os.path.join(STORAGE_DIR, 'approved')
 DB_PATH = os.path.join(APP_DIR, 'pascals_notes.db')
 ALLOWED_EXTENSIONS = {'pdf'}
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB per request (adjust if needed)
 
 # Admin password (default replaced per your request)
 ADMIN_PASSWORD = os.environ.get('PASCAL_ADMIN_PASSWORD', 'Paa@Len0181003@@#*$')
@@ -36,7 +35,6 @@ SECRET_KEY = os.environ.get('PASCAL_SECRET_KEY', hashlib.sha256(b"pascalsnotes_s
 # ----------------------
 # Subjects with grade support
 # ----------------------
-# For display and for upload grade choices
 SUBJECTS = {
     'Mathematics': ['8','9','10','11','12'],
     'Mathematical Literacy': ['10','11','12'],
@@ -51,9 +49,6 @@ SUBJECTS = {
     'Natural Sciences': ['8','9'],
 }
 
-# Flattened subjects list for selects
-SUBJECT_LIST = list(SUBJECTS.keys())
-
 # ----------------------
 # Ensure directories and DB
 # ----------------------
@@ -63,12 +58,10 @@ os.makedirs(APPROVED_DIR, exist_ok=True)
 # ----------------------
 # Database helpers
 # ----------------------
-
 def get_db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = get_db_conn()
@@ -88,7 +81,6 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
-
 
 # In case user has an older DB without grade column, ensure column exists
 def ensure_grade_column():
@@ -114,10 +106,8 @@ app.secret_key = SECRET_KEY
 # ----------------------
 # Utility
 # ----------------------
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
 
 def save_upload(file_storage, subdir=PENDING_DIR):
     original = file_storage.filename
@@ -149,7 +139,7 @@ BASE = """
       --bg:#f4f7fb;
       --glass: rgba(255,255,255,0.75);
     }
-    body{background:var(--bg);padding-top:5.2rem;padding-bottom:96px;color:#222} 
+    body{background:var(--bg);padding-top:5.2rem;padding-bottom:96px;color:#222}
     .navbar-brand{font-weight:700}
     .hero{background:linear-gradient(90deg, rgba(13,110,253,0.06), rgba(13,110,253,0.03));padding:2rem;border-radius:.6rem}
     .subject-card{border:0;border-radius:.6rem;box-shadow:0 6px 18px rgba(34,45,60,0.06);}
@@ -173,7 +163,6 @@ BASE = """
       <ul class="navbar-nav ms-auto">
         <li class="nav-item"><a class="nav-link" href="{{ url_for('browse') }}">All Notes</a></li>
         <li class="nav-item"><a class="nav-link" href="{{ url_for('upload') }}">Upload Notes</a></li>
-        
       </ul>
     </div>
   </div>
@@ -306,8 +295,8 @@ UPLOAD = """
         <input name="uploader" class="form-control" placeholder="e.g. Thabo N." />
       </div>
       <div class="mb-3">
-        <label class="form-label">File (PDF only)</label>
-        <input name="file" type="file" accept="application/pdf" class="form-control" required />
+        <label class="form-label">File (PDF only) — you can select multiple files</label>
+        <input name="files" type="file" accept="application/pdf" class="form-control" required multiple />
       </div>
       <button class="btn btn-success" type="submit">Upload (will be verified)</button>
     </form>
@@ -380,7 +369,7 @@ ADMIN_DASH = """
         </select>
       </div>
       <div class="mb-2">
-        <input name="file" type="file" accept="application/pdf" class="form-control" required />
+        <input name="files" type="file" accept="application/pdf" class="form-control" required multiple />
       </div>
       <button class="btn btn-success" type="submit">Upload & Approve</button>
     </form>
@@ -413,7 +402,6 @@ ADMIN_DASH = """
 # ----------------------
 # Routes
 # ----------------------
-
 @app.route('/')
 def index():
     return render_template_string(BASE + INDEX, subjects=SUBJECTS)
@@ -438,11 +426,9 @@ def browse():
     files = [dict(r) for r in rows]
     conn.close()
 
-    # build available grades for the selected subject (or all grades overall)
     if subject and subject in SUBJECTS:
         grades_available = SUBJECTS[subject]
     else:
-        # collect unique grades from SUBJECTS
         allg = set()
         for gl in SUBJECTS.values():
             allg.update(gl)
@@ -450,40 +436,53 @@ def browse():
 
     return render_template_string(BASE + BROWSE, files=files, subject=subject, grade=grade, grades_available=grades_available)
 
+# ---- Updated user upload (supports multiple files) ----
 @app.route('/upload', methods=['GET', 'POST'])
 def upload():
     if request.method == 'POST':
-        if 'file' not in request.files:
+        # files field is now 'files' and may contain many FileStorage objects
+        if 'files' not in request.files:
             flash('No file part')
             return redirect(request.url)
-        file = request.files['file']
-        if file.filename == '':
-            flash('No selected file')
+        uploaded_files = request.files.getlist('files')
+        if not uploaded_files or all(f.filename == '' for f in uploaded_files):
+            flash('No selected file(s)')
             return redirect(request.url)
+
         subject = request.form.get('subject')
         grade = request.form.get('grade')
         uploader = request.form.get('uploader', '').strip()
+
         if not subject or subject not in SUBJECTS:
             flash('Please choose a valid subject')
             return redirect(request.url)
         if not grade or grade not in SUBJECTS.get(subject, []):
             flash('Please choose a valid grade for the selected subject')
             return redirect(request.url)
-        if file and allowed_file(file.filename):
-            filename, original = save_upload(file, PENDING_DIR)
-            conn = get_db_conn()
-            c = conn.cursor()
-            now = datetime.utcnow().isoformat()
-            c.execute('INSERT INTO uploads (filename, original_name, subject, grade, uploader, status, uploaded_at) VALUES (?,?,?,?,?,?,?)',
-                      (filename, original, subject, grade, uploader, 'pending', now))
-            conn.commit()
-            conn.close()
-            flash('Uploaded successfully. Your file will be verified by admin.')
-            return redirect(url_for('upload'))
-        else:
-            flash('Only PDF files are allowed')
-            return redirect(request.url)
-    # send JSON structure of subjects for client-side grade population
+
+        accepted = 0
+        rejected = 0
+        conn = get_db_conn()
+        c = conn.cursor()
+        now = datetime.utcnow().isoformat()
+
+        for file in uploaded_files:
+            if file and file.filename and allowed_file(file.filename):
+                filename, original = save_upload(file, PENDING_DIR)
+                c.execute('INSERT INTO uploads (filename, original_name, subject, grade, uploader, status, uploaded_at) VALUES (?,?,?,?,?,?,?)',
+                          (filename, original, subject, grade, uploader, 'pending', now))
+                accepted += 1
+            else:
+                rejected += 1
+        conn.commit()
+        conn.close()
+
+        if accepted:
+            flash(f'Uploaded {accepted} file(s). They will be verified by admin.')
+        if rejected:
+            flash(f'{rejected} file(s) were not accepted (only PDFs allowed).')
+        return redirect(url_for('upload'))
+
     import json
     return render_template_string(BASE + UPLOAD, subjects=SUBJECTS, subjects_json=json.dumps(SUBJECTS))
 
@@ -558,31 +557,51 @@ def admin_dashboard():
     c.execute('SELECT * FROM uploads WHERE status = ? ORDER BY uploaded_at DESC', ('pending',))
     pending = [dict(r) for r in c.fetchall()]
     conn.close()
-    # admin grade options (10-12 + 8-9) - keep broad range
     admin_grades = ['8','9','10','11','12']
     return render_template_string(BASE + ADMIN_DASH, pending=pending, subjects=SUBJECTS, admin_grades=admin_grades)
 
+# ---- Updated admin upload (supports multiple files, auto-approved) ----
 @app.route('/admin/upload', methods=['POST'])
 @admin_required
 def admin_upload():
-    if 'file' not in request.files:
+    if 'files' not in request.files:
         flash('No file part')
         return redirect(url_for('admin_dashboard'))
-    file = request.files['file']
+
+    uploaded_files = request.files.getlist('files')
+    if not uploaded_files or all(f.filename == '' for f in uploaded_files):
+        flash('No selected file(s)')
+        return redirect(url_for('admin_dashboard'))
+
     subject = request.form.get('subject')
     grade = request.form.get('grade')
-    if file and allowed_file(file.filename) and subject in SUBJECTS and grade:
-        filename, original = save_upload(file, APPROVED_DIR)
-        conn = get_db_conn()
-        c = conn.cursor()
-        now = datetime.utcnow().isoformat()
-        c.execute('INSERT INTO uploads (filename, original_name, subject, grade, uploader, status, uploaded_at) VALUES (?,?,?,?,?,?,?)',
-                  (filename, original, subject, grade, 'admin', 'approved', now))
-        conn.commit()
-        conn.close()
-        flash('Uploaded and approved')
-    else:
-        flash('Invalid file or subject/grade')
+
+    if not subject or subject not in SUBJECTS or not grade:
+        flash('Invalid subject/grade')
+        return redirect(url_for('admin_dashboard'))
+
+    accepted = 0
+    rejected = 0
+    conn = get_db_conn()
+    c = conn.cursor()
+    now = datetime.utcnow().isoformat()
+
+    for file in uploaded_files:
+        if file and file.filename and allowed_file(file.filename):
+            filename, original = save_upload(file, APPROVED_DIR)
+            c.execute('INSERT INTO uploads (filename, original_name, subject, grade, uploader, status, uploaded_at) VALUES (?,?,?,?,?,?,?)',
+                      (filename, original, subject, grade, 'admin', 'approved', now))
+            accepted += 1
+        else:
+            rejected += 1
+
+    conn.commit()
+    conn.close()
+
+    if accepted:
+        flash(f'Uploaded & approved {accepted} file(s).')
+    if rejected:
+        flash(f'{rejected} file(s) were not accepted (only PDFs allowed).')
     return redirect(url_for('admin_dashboard'))
 
 @app.route('/admin/pending/<int:id>')
@@ -616,7 +635,6 @@ def admin_approve(id):
         conn.close()
         flash('This item is not pending')
         return redirect(url_for('admin_dashboard'))
-    # move file from pending to approved
     src = os.path.join(PENDING_DIR, row['filename'])
     dst = os.path.join(APPROVED_DIR, row['filename'])
     if os.path.exists(src):
@@ -638,7 +656,6 @@ def admin_reject(id):
         conn.close()
         flash('Not found')
         return redirect(url_for('admin_dashboard'))
-    # remove file from pending storage
     src = os.path.join(PENDING_DIR, row['filename'])
     if os.path.exists(src):
         os.remove(src)
